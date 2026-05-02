@@ -25,6 +25,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Optional
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
@@ -142,6 +143,37 @@ def fetch_text(url: str, max_chars: int = 8000) -> str:
     except (URLError, Exception) as exc:
         log.warning("Could not fetch %s: %s", url, exc)
         return ""
+
+
+# ---------------------------------------------------------------------------
+# URL validation
+# ---------------------------------------------------------------------------
+
+def validate_url(url: str) -> tuple[bool, str]:
+    """Check URL format and reachability. Returns (ok, error_message)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False, f"unsupported scheme: {parsed.scheme!r}"
+    if not parsed.netloc:
+        return False, "missing host"
+
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; BookmarkProcessor/1.0)"},
+                      method="HEAD")
+        with urlopen(req, timeout=10) as resp:
+            status = resp.status
+        if status >= 400:
+            return False, f"HTTP {status}"
+        return True, ""
+    except HTTPError as exc:
+        # HEAD not allowed — server is reachable, content may still be fetchable
+        if exc.code in (405, 403):
+            return True, ""
+        return False, f"HTTP {exc.code}"
+    except URLError as exc:
+        return False, str(exc.reason)
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +425,11 @@ def process_bookmark(bookmark: dict, group: dict, config: dict) -> None:
     title = bookmark.get("title", "")
     action = group.get("action", "")
     target = group.get("target", "Inbox")
+
+    ok, err = validate_url(url)
+    if not ok:
+        log.error("Skipping — invalid or unreachable URL (%s): %s", err, url)
+        return
 
     log.info("Processing [%s] → %s: %s", action, target, url)
 
