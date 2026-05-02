@@ -1,3 +1,8 @@
+# OpenAI — title/summary/tags generation; json_object response_format requires >=1.0.0
 openai>=1.30.0
+
+# watchdog — file system events for Safari/Firefox/Chrome bookmark file monitoring
 watchdog>=4.0.0
+
+# PyYAML — config.yaml parsing
 pyyaml>=6.0

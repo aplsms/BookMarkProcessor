@@ -16,9 +16,11 @@
 
 ## Вимоги
 
-- macOS із Safari
+- macOS (Safari, Firefox або Chrome)
 - Python 3.11+
-- OpenAI API key
+- OpenAI API key — для генерації заголовку, саммарі та тегів
+- **Firefox**: `places.sqlite` читається напряму, Firefox може бути відкритим
+- **Signal**: потребує запущеного [signal-cli REST API](https://github.com/bbernhard/signal-rest-api) (Docker)
 
 ## Встановлення
 
