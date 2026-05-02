@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Safari Bookmark Processor
+Bookmark Processor
 
-Watches Safari's Bookmarks.plist for new entries, matches each URL against
-groups defined in a YAML config, then uses OpenAI to generate summaries/tags
-and saves the result as a Markdown note in an Obsidian vault.
+Watches Safari, Firefox, or Chrome bookmarks for new entries, matches each URL
+against groups defined in a YAML config, then uses OpenAI to generate a title,
+summary and tags, saves a Markdown note to an Obsidian vault, and optionally
+sends notifications via Telegram, Mastodon, Signal, or Matrix.
 
 Copyright (C) 2026 Андрій Петренко
 Розповсюджується на умовах Ukrainian Restricted Jurisdictions Public License (URJPL) v1.0.
@@ -20,14 +21,17 @@ import logging
 import os
 import plistlib
 import re
+import shutil
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from typing import Optional
-from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
 from html.parser import HTMLParser
 
@@ -36,9 +40,11 @@ from openai import OpenAI
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-SAFARI_BOOKMARKS = Path.home() / "Library/Safari/Bookmarks.plist"
 DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
 DEFAULT_STATE = Path(__file__).parent / ".state.json"
+
+_SAFARI_DEFAULT  = Path.home() / "Library/Safari/Bookmarks.plist"
+_CHROME_DEFAULT  = Path.home() / "Library/Application Support/Google/Chrome/Default/Bookmarks"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,10 +76,12 @@ def save_state(state: dict, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Safari bookmark extraction
+# Bookmark loaders — Safari, Firefox, Chrome
 # ---------------------------------------------------------------------------
 
-def _extract(node, result: list) -> None:
+# ── Safari ──────────────────────────────────────────────────────────────────
+
+def _safari_walk(node, result: list) -> None:
     if isinstance(node, dict):
         if node.get("WebBookmarkType") == "WebBookmarkTypeLeaf":
             url = node.get("URLString", "")
@@ -81,18 +89,110 @@ def _extract(node, result: list) -> None:
             if url and not url.startswith("javascript:"):
                 result.append({"url": url, "title": title})
         for child in node.get("Children", []):
-            _extract(child, result)
+            _safari_walk(child, result)
     elif isinstance(node, list):
         for item in node:
-            _extract(item, result)
+            _safari_walk(item, result)
 
 
 def load_safari_bookmarks(path: Path) -> list[dict]:
     with open(path, "rb") as f:
         plist = plistlib.load(f)
     bookmarks: list[dict] = []
-    _extract(plist, bookmarks)
+    _safari_walk(plist, bookmarks)
     return bookmarks
+
+
+# ── Firefox ─────────────────────────────────────────────────────────────────
+
+def find_firefox_db() -> Optional[Path]:
+    """Return the path to the default Firefox places.sqlite on macOS."""
+    profiles_root = Path.home() / "Library/Application Support/Firefox/Profiles"
+    if not profiles_root.exists():
+        return None
+    for suffix in ("default-release", "default"):
+        for p in profiles_root.iterdir():
+            if p.name.endswith(f".{suffix}"):
+                db = p / "places.sqlite"
+                if db.exists():
+                    return db
+    # fallback: any profile that has places.sqlite
+    for p in profiles_root.iterdir():
+        db = p / "places.sqlite"
+        if db.exists():
+            return db
+    return None
+
+
+def load_firefox_bookmarks(path: Path) -> list[dict]:
+    # Copy to a temp file so we can read even while Firefox is running (DB is locked)
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        shutil.copy2(path, tmp_path)
+        con = sqlite3.connect(tmp_path)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            """
+            SELECT p.url, COALESCE(b.title, p.title, '') AS title
+            FROM   moz_bookmarks b
+            JOIN   moz_places    p ON b.fk = p.id
+            WHERE  b.type = 1
+              AND  p.url NOT LIKE 'place:%'
+            """
+        ).fetchall()
+        con.close()
+        return [{"url": r["url"], "title": r["title"]} for r in rows]
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ── Chrome ───────────────────────────────────────────────────────────────────
+
+def _chrome_walk(node: dict, result: list) -> None:
+    if node.get("type") == "url":
+        url = node.get("url", "")
+        if url and not url.startswith("javascript:"):
+            result.append({"url": url, "title": node.get("name", "")})
+    for child in node.get("children", []):
+        _chrome_walk(child, result)
+
+
+def load_chrome_bookmarks(path: Path) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    result: list[dict] = []
+    for root_key in ("bookmark_bar", "other", "synced"):
+        node = data.get("roots", {}).get(root_key, {})
+        if node:
+            _chrome_walk(node, result)
+    return result
+
+
+# ── Browser registry ─────────────────────────────────────────────────────────
+
+BookmarkLoader = Callable[[Path], list[dict]]
+
+BROWSERS: dict[str, BookmarkLoader] = {
+    "safari":  load_safari_bookmarks,
+    "firefox": load_firefox_bookmarks,
+    "chrome":  load_chrome_bookmarks,
+}
+
+
+def default_bookmarks_path(browser: str) -> Path:
+    if browser == "safari":
+        return _SAFARI_DEFAULT
+    if browser == "chrome":
+        return _CHROME_DEFAULT
+    if browser == "firefox":
+        db = find_firefox_db()
+        if db is None:
+            log.error("Firefox profile not found under ~/Library/Application Support/Firefox/Profiles")
+            sys.exit(1)
+        return db
+    log.error("Unknown browser %r. Choose: safari, firefox, chrome", browser)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +560,11 @@ def process_bookmark(bookmark: dict, group: dict, config: dict) -> None:
         notify_platforms(notify, config, bookmark, ai_result)
 
 
-def snapshot_state(bookmarks_file: Path, state: dict, state_file: Path) -> int:
+def snapshot_state(bookmarks_file: Path, state: dict, state_file: Path,
+                   loader: BookmarkLoader = load_safari_bookmarks) -> int:
     """Mark all current bookmarks as seen without processing them."""
     try:
-        bookmarks = load_safari_bookmarks(bookmarks_file)
+        bookmarks = loader(bookmarks_file)
     except Exception as exc:
         log.error("Failed to read bookmarks: %s", exc)
         return 0
@@ -481,9 +582,10 @@ def snapshot_state(bookmarks_file: Path, state: dict, state_file: Path) -> int:
     return added
 
 
-def scan_and_process(bookmarks_file: Path, config: dict, state: dict, state_file: Path) -> int:
+def scan_and_process(bookmarks_file: Path, config: dict, state: dict, state_file: Path,
+                     loader: BookmarkLoader = load_safari_bookmarks) -> int:
     try:
-        bookmarks = load_safari_bookmarks(bookmarks_file)
+        bookmarks = loader(bookmarks_file)
     except Exception as exc:
         log.error("Failed to read bookmarks: %s", exc)
         return 0
@@ -521,11 +623,13 @@ def scan_and_process(bookmarks_file: Path, config: dict, state: dict, state_file
 # ---------------------------------------------------------------------------
 
 class _BookmarksHandler(FileSystemEventHandler):
-    def __init__(self, bookmarks_file: Path, config: dict, state: dict, state_file: Path):
+    def __init__(self, bookmarks_file: Path, config: dict, state: dict,
+                 state_file: Path, loader: BookmarkLoader):
         self._file = bookmarks_file
         self._config = config
         self._state = state
         self._state_file = state_file
+        self._loader = loader
         self._last_run: float = 0
 
     def on_modified(self, event):
@@ -536,8 +640,8 @@ class _BookmarksHandler(FileSystemEventHandler):
             return
         self._last_run = now
         log.info("Bookmarks file changed — scanning…")
-        time.sleep(0.5)  # wait for Safari to finish writing
-        scan_and_process(self._file, self._config, self._state, self._state_file)
+        time.sleep(0.5)  # wait for browser to finish writing
+        scan_and_process(self._file, self._config, self._state, self._state_file, self._loader)
 
 
 # ---------------------------------------------------------------------------
@@ -566,15 +670,18 @@ def process_url(url: str, config: dict, group_override: Optional[str] = None) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Watch Safari bookmarks and save new links to Obsidian via OpenAI."
+        description="Watch browser bookmarks and save new links to Obsidian via OpenAI."
     )
     parser.add_argument("url", nargs="?", metavar="URL",
                         help="Process a single URL and exit")
     parser.add_argument("--group", metavar="NAME",
                         help="Force a specific group for the given URL (skips pattern matching)")
+    parser.add_argument("--browser", choices=list(BROWSERS), default="safari",
+                        help="Browser to read bookmarks from (default: safari)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, metavar="FILE")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE, metavar="FILE")
-    parser.add_argument("--bookmarks", type=Path, default=SAFARI_BOOKMARKS, metavar="FILE")
+    parser.add_argument("--bookmarks", type=Path, default=None, metavar="FILE",
+                        help="Override bookmarks file path (auto-detected by --browser if omitted)")
     parser.add_argument("--once", action="store_true", help="Scan once and exit")
     parser.add_argument(
         "--init", action="store_true",
@@ -601,25 +708,29 @@ def main() -> None:
         process_url(args.url, config, group_override=args.group)
         return
 
+    loader: BookmarkLoader = BROWSERS[args.browser]
+    bookmarks_file: Path = args.bookmarks or default_bookmarks_path(args.browser)
+    log.info("Browser: %s  |  File: %s", args.browser, bookmarks_file)
+
     state: dict = {} if args.reset else load_state(args.state)
 
     if args.init:
-        snapshot_state(args.bookmarks, state, args.state)
+        snapshot_state(bookmarks_file, state, args.state, loader)
         return
 
     if args.once or args.reset:
-        scan_and_process(args.bookmarks, config, state, args.state)
+        scan_and_process(bookmarks_file, config, state, args.state, loader)
         return
 
     # Initial scan on startup — only delta since last run
-    scan_and_process(args.bookmarks, config, state, args.state)
+    scan_and_process(bookmarks_file, config, state, args.state, loader)
 
     # Watch for changes
-    handler = _BookmarksHandler(args.bookmarks, config, state, args.state)
+    handler = _BookmarksHandler(bookmarks_file, config, state, args.state, loader)
     observer = Observer()
-    observer.schedule(handler, str(args.bookmarks.parent), recursive=False)
+    observer.schedule(handler, str(bookmarks_file.parent), recursive=False)
     observer.start()
-    log.info("Watching %s  (Ctrl-C to stop)", args.bookmarks)
+    log.info("Watching %s  (Ctrl-C to stop)", bookmarks_file)
     try:
         while True:
             time.sleep(1)
