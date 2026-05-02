@@ -1,0 +1,103 @@
+# Safari Bookmark Processor — example configuration
+# Copy this file to config.yaml and fill in your values.
+
+openai:
+  api_key: ""          # or set OPENAI_API_KEY env var
+  model: gpt-4o-mini   # gpt-4o for higher quality
+  language: Ukrainian  # default summary language; override per group
+
+obsidian:
+  vault_path: ~/Documents/Obsidian   # path to your Obsidian vault
+
+# ── Notification platforms (fill in only the ones you use) ──────────────────
+
+telegram:
+  bot_token: ""        # or set TELEGRAM_BOT_TOKEN env var
+  chat_id: ""          # or set TELEGRAM_CHAT_ID env var  (@username or numeric ID)
+
+mastodon:
+  instance_url: "https://mastodon.social"
+  access_token: ""     # or set MASTODON_ACCESS_TOKEN env var
+  visibility: public   # public | unlisted | private | direct
+
+signal:
+  # Requires signal-cli REST API running locally:
+  # https://github.com/bbernhard/signal-rest-api
+  api_url: "http://localhost:8080"
+  number: ""           # your registered Signal number, e.g. "+380501234567"
+  recipients:          # phone numbers or group IDs
+    - "+380671234567"
+
+matrix:
+  homeserver: "https://matrix.org"
+  access_token: ""     # or set MATRIX_ACCESS_TOKEN env var
+  room_id: ""          # e.g. "!abcdef:matrix.org"  (or set MATRIX_ROOM_ID env var)
+
+# ── Groups ───────────────────────────────────────────────────────────────────
+# action:  summary | tags | tags+summary | "" (none)
+# target:  folder path inside the Obsidian vault (created automatically)
+# notify:  list of platforms to send to (telegram, mastodon, signal, matrix)
+# language: override summary language for this group
+groups:
+  - name: Research & Papers
+    pattern:
+      - "arxiv\\.org"
+      - "semanticscholar\\.org"
+      - "scholar\\.google"
+      - "pubmed\\.ncbi"
+      - "dl\\.acm\\.org"
+    action: tags+summary
+    target: Research/Papers
+    language: English    # keep academic summaries in English
+    notify:
+      - telegram
+
+  - name: GitHub
+    pattern:
+      - "github\\.com/[^/]+/[^/]+"   # repo pages only
+    action: tags+summary
+    target: Tech/GitHub
+    notify:
+      - telegram
+      - matrix
+
+  - name: Tech Articles
+    pattern:
+      - "medium\\.com"
+      - "dev\\.to"
+      - "substack\\.com"
+      - "hackernoon\\.com"
+      - "thenewstack\\.io"
+      - "news\\.ycombinator\\.com"
+    action: summary
+    target: Tech/Articles
+
+  - name: YouTube
+    pattern:
+      - "youtube\\.com/watch"
+      - "youtu\\.be/"
+    action: tags
+    target: Media/YouTube
+
+  - name: Hacker News
+    pattern:
+      - "news\\.ycombinator\\.com/item"
+    action: tags+summary
+    target: Tech/HackerNews
+
+  - name: Docs & References
+    pattern:
+      - "docs\\."
+      - "/docs/"
+      - "developer\\."
+      - "pkg\\.go\\.dev"
+      - "docs\\.rs"
+    action: tags
+    target: Tech/Docs
+
+  # Catch-all — no AI processing, just saves the link
+  - name: Other
+    pattern:
+      - ".*"
+    action: ""
+    target: Inbox
